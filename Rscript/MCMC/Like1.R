@@ -16,11 +16,11 @@
 
 Like1 <- function(theta){
   #mobility
-  R_daily <- Rt_fun(theta = theta, x = mat_mob )
-  Rt <- m_w_delay %*% R_daily
+  R_daily <- Rt_fun(theta = theta, x = M )
+  Rt <- H %*% R_daily
 
-  logL <- colSums(dpois(x = mD, lambda = Rt*mOt, log = TRUE) ,na.rm=TRUE)
-  # logL <- (dpois(x = mD, lambda = Rt*mOt, log = TRUE) )
+  logL <- colSums(dpois(x = mD, lambda = Rt*Ot, log = TRUE) ,na.rm=TRUE)
+  # logL <- (dpois(x = mD, lambda = Rt*Ot, log = TRUE) )
   
   return(logL)
 }
