@@ -1,0 +1,640 @@
+---
+title: "ccc"
+author: "Pierre Nouvellet"
+date: "2019-07"
+---
+
+```{r options, include = FALSE, message = FALSE, warning = FALSE, error = FALSE}
+library(knitr)
+library(Hmisc)
+library(EpiEstim)
+library(zoo)
+
+opts_chunk$set(collapse = TRUE)
+
+opts_chunk$set(fig.path='figs/withHierarchical/', fig.keep='high', 
+               dev=c('png'), fig.width=9, fig.height=6, cache=FALSE,
+               tidy=FALSE, warning=FALSE, fig.show="asis"
+ 	       )
+
+sapply(paste0('Rscript/withHierarchical/pre_MCMC/',
+              (list.files('Rscript/withHierarchical/pre_MCMC/'))),FUN = source)
+sapply(paste0('Rscript/withHierarchical/plots/',
+              (list.files('Rscript/withHierarchical/plots/'))),FUN = source)
+
+```
+
+# input data
+
+## load Epi and mobility data
+
+```{r}
+
+d <- readRDS(file='Rdata/input/data_2020-04-12.rds')
+#
+country <- as.character(d$Country)
+# mean sd of ditrivution infection to death
+mu_id = 18.8
+si_std = .45*mu_id
+
+
+```
+
+
+
+load and clean mobility data.
+
+```{r, echo = FALSE}
+
+d_m <- read.csv(file='Rdata/mobility/applemobilitytrends-2020-04-13.csv',stringsAsFactors = FALSE)
+# d_m needs 3 colums for "geo_type"            "region"              "transportation_type" 
+# +one column per dates names as 'X.2020.01.20'
+
+
+#miss-spelled
+country[-which(as.character(country) %in% as.character(d_m$region))]
+
+# missing for apple: Algeria, China, Dominican_Republic, Ecuador, Iran, Peru, South_Korea, 
+#corrections to match name in ECDC data
+d_m$region[which(d_m$region %in% 'Czech Republic')] <- 'Czechia'
+d_m$region[which(d_m$region %in% 'UK')] <- 'United_Kingdom'
+d_m$region[which(d_m$region %in% 'United States')] <- 'United_States_of_America'
+
+# check
+if (length(country[-which(country %in% d_m$region)])>0){
+  print('warning')
+  country[-which(country %in% d_m$region)]
+}
+
+# include country with data in both dataset
+f1 <- which(country %in% d_m$region)
+f2 <- which(d_m$region %in% country)
+
+d_m <- d_m[f2,]
+
+d$I_active_transmission <- d$I_active_transmission[,c(1,f1+1)]
+d$D_active_transmission <- d$D_active_transmission[,c(1,f1+1)]
+d$Country <- d$Country[f1]
+
+# include dates with data in both
+dates <- as.Date(substr(names(d_m[,-c(1:3)]),start = 2, stop = 11),format='%Y.%m.%d')
+f1 <- which(d$I_active_transmission$dates %in% dates)
+f2 <- which(dates %in% d$I_active_transmission$dates)
+
+d_m <- d_m[,c(1,2,3,3+f2)]
+
+d$I_active_transmission <- d$I_active_transmission[f1,]
+d$D_active_transmission <- d$D_active_transmission[f1,]
+
+```
+
+
+
+# useful data
+
+```{r}
+# correct epi
+D <- d$D_active_transmission
+mD <- as.matrix(D[,-1])
+I <- d$I_active_transmission
+
+cumD <- data.frame(D$dates,apply(D[,-1],2,cumsum))
+cumI <- data.frame(I$dates,apply(I[,-1],2,cumsum))
+
+N_geo <- ncol(D)-1
+N_days <- nrow(D)
+country <- as.character(d$Country)
+
+```
+
+
+## process mobility data
+
+load data (dots), get weekly average, interpolate between (blue line)
+
+```{r, echo = FALSE}
+
+mobility <- process_mobility(d_m = d_m)
+
+
+layout(matrix(1:4,2,2))
+for (i  in 1:N_geo){
+  plot(mobility$mob_raw$dates,mobility$mob_raw[,i+1],main = country[i],#ylim = c(0,1),
+       xlab = '',ylab = 'prop. mobility')
+  lines(mobility$mob_combined_smooth$dates,mobility$mob_combined_smooth[,i+1],col='blue')
+  # lines(mob3[,i+1],col='red')
+  abline(h=1,lwd=2,col='red',lty=2)
+}
+```
+
+
+
+## process Epi data
+
+load Epi data and serial interval
+```{r, echo = FALSE}
+## # serial interval estimate used: mean = 3.96, sd =  4.75
+## # Teunis et al.
+SI <- gamma_dist_EpiEstim(si_mu =  d$si_mean[2], 
+                          si_std  = d$si_std[2], 
+                          SItrunc = 30)
+
+plot(seq(0, SI$SItrunc), SI$dist, type = "h",
+          lwd = 10, lend = 1, xlab = "time (days)", ylab = "frequency")
+title(main = "Discrete distribution of the serial interval of COVID-19")
+
+
+
+```
+
+## delay infection to death
+
+```{r, echo = FALSE}
+
+delta_id <- gamma_dist_EpiEstim(si_mu = mu_id , 
+                                si_std  = .45*mu_id, 
+                                SItrunc = 50)
+
+plot(seq(0, delta_id$SItrunc), delta_id$dist, type = "h",
+     lwd = 10, lend = 1, xlab = "time (days)", ylab = "frequency")
+title(main = "Discrete distribution of the delay infection to death")
+
+sum(delta_id$dist[1:7])
+
+
+```
+
+# Useful formatting
+
+see paper
+
+```{r}
+
+# delay death infection matrix
+H <- matrix(0,nrow = N_days, ncol = N_days)
+for (i in 1:N_days){
+  f <- max(c(1,i-delta_id$SItrunc))
+  H[i,f:i] <- rev(delta_id$dist)[((delta_id$SItrunc+1)-(i-f)):(delta_id$SItrunc+1)]
+  if (i>1) H[i,f:i] <-  H[i,f:i]/sum( H[i,f:i])
+}
+
+# delay SI death to death matrix
+W <- matrix(0,nrow = N_days, ncol = N_days)
+for (i in 1:N_days){
+  f <- max(c(1,i-SI$SItrunc))
+  W[i,f:i] <- rev(SI$dist)[((SI$SItrunc+1)-(i-f)):(SI$SItrunc+1)]
+  # if (i>1) H[i,f:i] <-  H[i,f:i]/sum( H[i,f:i])
+}
+
+# overall infectivity matrix
+Ot <- W%*%mD
+# correct infectivity when >0 case observed but no infectivity
+for(i in 1:N_geo){
+  Ot[ which( (D[,i+1]>0) & (Ot[,i] ==0 ) ),i] <-NA
+}
+
+
+
+# matrix of mobility and delayed version
+M <- as.matrix(mobility$mob_combined_smooth[,-1])
+# M_D <- H %*% M
+```
+
+
+## Baseline model: estimate Rt
+
+get epiestim Rt estimates with 7 day time window.
+
+```{r, echo = FALSE}
+
+t.window <- 7
+R_epiest <- list()
+
+for (i in 1:N_geo){
+  
+  obs <- D[,c(1,i+1)]
+
+  epi_res <- EpiEstim::estimate_R(obs[,2],method = 'non_parametric_si',
+                                  config = make_config(list(
+                                    mean_prior = 1,
+                                    si_distr = SI$dist, 
+                                    t_start = seq(2,length(obs$date)-t.window+1,1), 
+                                    t_end = seq(t.window+1,length(obs$date),1))))
+  
+  epi_res$R$t_mid <-  obs$date[epi_res$R$t_end] - round(t.window/2) +1
+  R_epiest[[i]] <- epi_res
+}
+
+# format outputs
+temp <- D
+temp[,-1] <- NA
+
+results_baseline <- list(median_R = temp,
+                         low_R = temp,
+                         up_R = temp,
+                         CV = temp,
+                         CV_below.2 = temp,
+                         M_D = temp)
+
+for (i in 1:N_geo){
+  f <- which(results_baseline$median_R$dates %in% R_epiest[[i]]$R$t_mid)
+  results_baseline$median_R[f,i+1] <- R_epiest[[i]]$R$`Median(R)`
+  results_baseline$low_R[f,i+1] <- R_epiest[[i]]$R$`Quantile.0.025(R)`
+  results_baseline$up_R[f,i+1] <- R_epiest[[i]]$R$`Quantile.0.975(R)`
+  
+  results_baseline$CV[f,i+1] <- R_epiest[[i]]$R$`Std(R)`/R_epiest[[i]]$R$`Mean(R)`
+  results_baseline$CV_below.2[,i+1] <- results_baseline$CV[,i+1] < .2
+  
+  # results_baseline$M_D[,i+1] <- M_D[,i]
+}
+
+```
+
+
+# full model
+
+## parameters 
+
+```{r}
+# epi
+R0 <- 5
+# for risk
+b <- 10
+std <- .1
+
+theta0 <- c(rep(R0,N_geo),
+            rep(b,N_geo),
+            rep(std,N_geo))
+
+prior_theta <- matrix(c(rep(c(0,10),N_geo),
+                        rep(c(0,1e3),N_geo),
+                      rep(c(0,1e3),N_geo)),
+                      length(theta0),2, byrow=TRUE)
+
+# parameter names
+f0 <- function(x) paste0('R0_',x)
+f1 <- function(x) paste0('beta_',x)
+f2 <- function(x) paste0('sd_',x)
+n_t<- c(sapply(country,f0), sapply(country,f1), sapply(country,f2))
+
+# sd dev for proposal
+sigma <- rep(1e-1,length(theta0))
+
+# useful functions
+sapply(paste0('Rscript/withHierarchical/MCMC/',
+              (list.files('Rscript/withHierarchical/MCMC/'))),FUN = source)
+ 
+```
+
+## run MCMC
+
+```{r}
+#check
+rep <- 1e2
+# res <- MCMC_iter(iter = rep, theta0 = theta0, s = sigma)
+res <- MCMC_full(iter = rep, theta0 = theta0, s = sigma, repli_adapt = 10, within_iter = rep/10)
+
+# save.image(file = 'temp.RData')
+
+
+```
+
+
+## check convergence
+
+
+```{r}
+
+Acc <- colSums(diff(res$theta)!=0)/(rep-1)
+plot(res$logL[2:nrow(res$theta),1])
+layout(matrix(1:4,2,2))
+for (i in 1:length(theta0)){
+  plot(res$theta[,i],
+       main = paste0(n_t[i],' - ',round(Acc[i]*100)))#,       ylim = prior_theta[i,])
+}
+
+```
+
+## Rt daily and Rt_D2
+
+### observed mobility
+
+```{r}
+
+Rt_daily <- array(NA,dim = c(N_days,N_geo,rep))
+Rt_D2 <- Rt_daily
+m_eff <- Rt_daily
+
+for (j in 1:rep){
+  
+  R_daily <- Rt_fun(theta = res$theta[j,], x = M )
+  Rt_daily[,,j] <- R_daily
+  Rt_D2[,,j] <- H %*% R_daily
+
+  B <- rep(1,nrow(M)) %*% t(res$theta[j,(2-1)*N_geo+ (1:N_geo)])
+  m_eff[,,j] <- 1 + 1/B * log( H %*% exp( - B * (1-M) ) )
+  
+}
+
+```
+
+### assumed mobility
+
+
+```{r}
+
+n_d <- 1e2
+Rt_assumed_mob <- array(NA,dim = c(n_d,N_geo,rep))
+x <-  matrix(seq(0,1,length.out = n_d),n_d,N_geo,byrow = FALSE)
+
+for (j in 1:rep){
+  R_daily <- Rt_fun(theta = res$theta[j,], x = 1-x )
+  Rt_assumed_mob[,,j] <- R_daily
+}
+
+```
+
+## summaries
+
+### Summary for Rt daily and Rt_D2
+
+```{r}
+
+# format outputs
+temp <- D
+temp[,-1] <- NA
+
+results_full_Rt_daily <- list(median_R = temp,
+                              low_R = temp,
+                              up_R = temp,
+                              M = temp)
+
+results_full_Rt_D2 <- list(median_R = temp,
+                              low_R = temp,
+                              up_R = temp,
+                              M_D = temp)
+
+results_meff <- list(median_meff = temp,
+                     low_meff = temp,
+                     up_meff = temp)
+
+for (i in 1:N_geo){
+
+  temp <- apply(Rt_daily[,i,],1,quantile,c(.5,.025,.975),na.rm = TRUE)
+  results_full_Rt_daily$median_R[,i+1] <- temp[1,]
+  results_full_Rt_daily$low_R[,i+1] <- temp[2,]
+  results_full_Rt_daily$up_R[,i+1] <- temp[3,]
+  results_full_Rt_daily$M[,i+1] <- M[,i]
+
+  temp <- apply(Rt_D2[,i,],1,quantile,c(.5,.025,.975),na.rm = TRUE)
+  results_full_Rt_D2$median_R[,i+1] <- temp[1,]
+  results_full_Rt_D2$low_R[,i+1] <- temp[2,]
+  results_full_Rt_D2$up_R[,i+1] <- temp[3,]
+  # results_full_Rt_D2$M_D[,i+1] <- M_D[,i]
+
+  temp <- apply(m_eff[,i,],1,quantile,c(.5,.025,.975),na.rm = TRUE)
+  results_meff$median_meff[,i+1] <- temp[1,]
+  results_meff$low_meff[,i+1] <- temp[2,]
+  results_meff$up_meff[,i+1] <- temp[3,]
+
+
+}
+
+```
+
+
+### Summary for Rt assumed mobility
+
+
+```{r}
+
+# format outputs
+temp <- data.frame(matrix(NA,nrow = n_d, ncol = 1+N_geo))
+temp[,1] <- x[,1]
+names(temp) <- c('mobility', country)
+
+results_full_Rt_assumed_mob <- list(median_R = temp,
+                              low_R = temp,
+                              up_R = temp)
+
+
+for (i in 1:N_geo){
+
+  temp <- apply(Rt_assumed_mob[,i,],1,quantile,c(.5,.025,.975),na.rm = TRUE)
+  results_full_Rt_assumed_mob$median_R[,i+1] <- temp[1,]
+  results_full_Rt_assumed_mob$low_R[,i+1] <- temp[2,]
+  results_full_Rt_assumed_mob$up_R[,i+1] <- temp[3,]
+
+}
+
+```
+
+
+# forecast and predictions
+
+## short-term
+
+```{r}
+n_pred <- 7
+rep_sim <- 1e2
+# choose future mobility
+M_pred <- rbind(M,matrix(M[nrow(M),],n_pred,N_geo,byrow = TRUE))
+
+# useful functions
+sapply(paste0('Rscript/projections/',(list.files('Rscript/projections/'))),FUN = source)
+
+res_projection <- mobility_prediction(n_pred = n_pred, rep_sim = rep_sim)
+
+temp <- data.frame(dates = seq(1,n_pred) + D$dates[nrow(D)],
+                   matrix(NA,n_pred,N_geo))
+names(temp) <- c('dates',country)
+summary_proj <- list(median = temp,
+                           low = temp,
+                           up = temp)
+for (i in 1:N_geo){
+  temp <- apply(res_projection$D_pred[,i,],1,quantile,c(.5,.025,.975))
+  summary_proj$median[,i+1] <- temp[1,]
+  summary_proj$low[,i+1] <- temp[2,]
+  summary_proj$up[,i+1] <- temp[3,]
+}
+```
+
+
+## longer-term
+
+### first scenario
+
+```{r}
+n_pred <- 60
+rep_sim <- 1e2
+# choose future mobility
+M_pred <- rbind(M,matrix(0.05,n_pred,N_geo,byrow = TRUE))
+
+res_projection_LT1 <- mobility_prediction(n_pred = n_pred, rep_sim = rep_sim)
+
+temp <- data.frame(dates = seq(1,n_pred) + D$dates[nrow(D)],
+                   matrix(NA,n_pred,N_geo))
+names(temp) <- c('dates',country)
+summary_proj_LT1 <- list(median = temp,
+                           low = temp,
+                           up = temp)
+for (i in 1:N_geo){
+  temp <- apply(res_projection_LT1$D_pred[,i,],1,quantile,c(.5,.025,.975),na.rm=TRUE)
+  summary_proj_LT1$median[,i+1] <- temp[1,]
+  summary_proj_LT1$low[,i+1] <- temp[2,]
+  summary_proj_LT1$up[,i+1] <- temp[3,]
+}
+```
+
+
+### Second scenario
+
+```{r}
+n_pred <- 60
+rep_sim <- 1e2
+# choose future mobility
+new_M <- matrix(NA,n_pred,N_geo,byrow = TRUE)
+for (i in 1:N_geo){
+  x <- 0:(n_pred-1)
+  new_M[,i] <- (1-M[nrow(M),i])/(n_pred-1) * x + M[nrow(M),i]
+}
+M_pred <- rbind(M,new_M)
+
+res_projection_LT2 <- mobility_prediction(n_pred = n_pred, rep_sim = rep_sim)
+
+temp <- data.frame(dates = seq(1,n_pred) + D$dates[nrow(D)],
+                   matrix(NA,n_pred,N_geo))
+names(temp) <- c('dates',country)
+summary_proj_LT2 <- list(median = temp,
+                           low = temp,
+                           up = temp)
+for (i in 1:N_geo){
+  temp <- apply(res_projection_LT2$D_pred[,i,],1,quantile,c(.5,.025,.975),na.rm=TRUE)
+  summary_proj_LT2$median[,i+1] <- temp[1,]
+  summary_proj_LT2$low[,i+1] <- temp[2,]
+  summary_proj_LT2$up[,i+1] <- temp[3,]
+}
+
+```
+
+
+# Plots
+
+
+
+## Plotting outputs for each country
+
+```{r, country_plotwithHierarchical}
+
+for (i in 1:N_geo){
+  niceplot(i)
+}
+
+```
+
+## plot forecasts
+
+
+# forecast and predictions
+
+## short-term
+
+```{r, STwithHierarchical}
+temp <- summary_proj
+
+layout(matrix(1:4,2,2))
+
+for (i in 1:N_geo){
+
+ plot_proj(i,threshold = FALSE,log = FALSE)
+}
+
+```
+
+
+## longer-term
+
+### first scenario
+
+```{r, LT1withHierarchical}
+
+temp <- summary_proj_LT1
+
+layout(matrix(1:4,2,2))
+
+for (i in 1:N_geo){
+
+ plot_proj(i,threshold = TRUE,log = FALSE)
+}
+
+
+```
+
+
+### Second scenario
+
+```{r,LT2withHierarchical}
+temp <- summary_proj_LT2
+
+layout(matrix(1:4,2,2))
+
+for (i in 1:N_geo){
+
+ plot_proj(i,threshold = FALSE,log = TRUE)
+}
+
+
+```
+
+### UK
+
+```{r, UKwithHierarchical}
+f <- which(country %in% 'United_Kingdom')
+
+layout(matrix(1:4,2,2))
+
+temp <- summary_proj
+plot_proj(f,threshold = FALSE,log = FALSE)
+temp <- summary_proj_LT1
+plot_proj(f,threshold = TRUE,log = FALSE)
+temp <- summary_proj_LT2
+plot_proj(f,threshold = TRUE,log = TRUE)
+
+
+
+```
+
+## containments
+
+when contained??
+
+```{r}
+
+contained <- data.frame(country = country,
+                        median = rep(NA,N_geo),
+                        low = rep(NA,N_geo),
+                        up = rep(NA,N_geo))
+
+for (i in 1:N_geo){
+
+  f <- c(tail( which(results_full_Rt_assumed_mob$median_R[i+1]>1) , 1 ),
+    tail(  which(results_full_Rt_assumed_mob$median_R[i+1]>1),1) +1 )
+
+  contained$median[i] <- mean(results_full_Rt_assumed_mob$median_R[f,1])
+
+    f <- c(tail( which(results_full_Rt_assumed_mob$low_R[i+1]>1) , 1 ),
+    tail(  which(results_full_Rt_assumed_mob$low_R[i+1]>1),1) +1 )
+
+  contained$low[i] <- mean(results_full_Rt_assumed_mob$low_R[f,1])
+
+    f <- c(tail( which(results_full_Rt_assumed_mob$up_R[i+1]>1) , 1 ),
+    tail(  which(results_full_Rt_assumed_mob$up_R[i+1]>1),1) +1 )
+
+  contained$up[i] <- mean(results_full_Rt_assumed_mob$up_R[f,1])
+}
+
+write.csv(x = contained,file = 'Rdata/results_containedwithHierarchical.csv')
+
+save.image(file = 'Rdata/check_mobilitywithHierarchical.RData')
+
+```
